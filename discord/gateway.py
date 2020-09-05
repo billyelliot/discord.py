@@ -67,7 +67,8 @@ class WebSocketClosure(Exception):
 EventListener = namedtuple('EventListener', 'predicate event result future')
 
 class GatewayRatelimiter:
-    def __init__(self, count=120, per=60.0):
+    def __init__(self, count=110, per=60.0):
+        # The default is 110 to give room for at least 10 heartbeats per minute
         self.max = count
         self.remaining = count
         self.window = 0.0
@@ -128,7 +129,7 @@ class KeepAliveHandler(threading.Thread):
 
             data = self.get_payload()
             log.debug(self.msg, self.shard_id, data['d'])
-            coro = self.ws.send_as_json(data)
+            coro = self.ws.send_heartbeat(data)
             f = asyncio.run_coroutine_threadsafe(coro, loop=self.ws.loop)
             try:
                 # block until sending is complete
@@ -558,7 +559,7 @@ class DiscordWebSocket:
     async def send(self, data):
         delay = self._rate_limiter.get_delay()
         if delay:
-            log.warning('WebSocket is ratelimited, waiting %.2f seconds', delay)
+            log.warning('WebSocket in shard ID %s is ratelimited, waiting %.2f seconds', self.shard_id, delay)
             await asyncio.sleep(delay)
 
         self._dispatch('socket_raw_send', data)
@@ -567,6 +568,14 @@ class DiscordWebSocket:
     async def send_as_json(self, data):
         try:
             await self.send(utils.to_json(data))
+        except RuntimeError as exc:
+            if not self._can_handle_close():
+                raise ConnectionClosed(self.socket, shard_id=self.shard_id) from exc
+
+    async def send_heartbeat(self, data):
+        # This bypasses the rate limit handling code since it has a higher priority
+        try:
+            await self.socket.send_str(utils.to_json(data))
         except RuntimeError as exc:
             if not self._can_handle_close():
                 raise ConnectionClosed(self.socket, shard_id=self.shard_id) from exc
@@ -697,6 +706,8 @@ class DiscordVoiceWebSocket:
     async def send_as_json(self, data):
         log.debug('Sending voice websocket frame: %s.', data)
         await self.ws.send_str(utils.to_json(data))
+
+    send_heartbeat = send_as_json
 
     async def resume(self):
         state = self._connection
